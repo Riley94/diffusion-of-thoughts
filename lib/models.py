@@ -1,11 +1,6 @@
-import apex.normalization
-# try:
-#     import flash_attn.flash_attn_interface
-#     import flash_attn.ops.fused_dense
-#     use_flash_attn = True
-# except:
-import xformers.ops
-    # use_flash_attn = False
+# Remove both apex and xformers imports
+# import apex.normalization
+# import xformers.ops
 
 import lib.utils
 import mup
@@ -45,6 +40,25 @@ class LayerNorm(nn.Module):
             x = F.layer_norm(x.float(), [self.dim])
         return x * self.weight[None,None,:]
 
+
+# Custom RMSNorm implementation to replace apex.normalization.FusedRMSNorm
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.dim = dim
+        
+    def forward(self, x):
+        with torch.cuda.amp.autocast(enabled=False):
+            # Convert to float32 for better precision during normalization
+            x_float = x.float()
+            # Calculate RMS
+            norm_x = torch.sqrt(torch.mean(x_float**2, dim=-1, keepdim=True) + self.eps)
+            x_normalized = x_float / norm_x
+        return self.weight * x_normalized
+
+
 def residual_linear(x, W, x_skip, residual_scale):
     """x_skip + residual_scale * W @ x"""
     dim_out, dim_in = W.shape[0], W.shape[1]
@@ -56,6 +70,42 @@ def residual_linear(x, W, x_skip, residual_scale):
     ).view(*x.shape[:-1], dim_out)
 
 
+# Standard attention implementation to replace xformers
+def attention(q, k, v, attn_bias=None, causal=False):
+    """
+    q, k, v: [batch_size, seq_len, num_heads, head_dim]
+    attn_bias: Optional attention bias tensor
+    causal: Whether to apply causal mask
+    """
+    batch_size, seq_len, num_heads, head_dim = q.shape
+    
+    # Reshape for matrix multiplication
+    q = q.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+    k = k.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+    v = v.transpose(1, 2)  # [batch_size, num_heads, seq_len, head_dim]
+    
+    # Compute attention scores
+    scale = 1.0 / torch.sqrt(torch.tensor(head_dim, dtype=q.dtype))
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale  # [batch_size, num_heads, seq_len, seq_len]
+    
+    # Apply attention bias if provided
+    if attn_bias is not None:
+        scores = scores + attn_bias
+    
+    # Apply causal mask if needed
+    if causal:
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=q.device), diagonal=1)
+        scores = scores.masked_fill(causal_mask.bool().unsqueeze(0).unsqueeze(0), float("-inf"))
+    
+    # Softmax and apply attention to values
+    attn = F.softmax(scores, dim=-1)
+    out = torch.matmul(attn, v)  # [batch_size, num_heads, seq_len, head_dim]
+    
+    # Reshape back
+    out = out.transpose(1, 2)  # [batch_size, seq_len, num_heads, head_dim]
+    return out
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, causal, residual_scale):
         super().__init__()
@@ -64,16 +114,15 @@ class TransformerBlock(nn.Module):
         self.dim = dim
         self.n_heads = n_heads
         self.residual_scale = residual_scale
+        self.head_dim = dim // n_heads
 
-        self.rmsnorm1 = apex.normalization.FusedRMSNorm(dim)
+        # Replace apex.normalization.FusedRMSNorm with our RMSNorm
+        self.rmsnorm1 = RMSNorm(dim)
         self.attn_qkv = nn.Linear(dim, 3*dim, bias=False)
         self.attn_out = nn.Linear(dim, dim, bias=False)
 
-        self.rmsnorm2 = apex.normalization.FusedRMSNorm(dim)
-        # if use_flash_attn:
-        #     self.mlp = flash_attn.ops.fused_dense.FusedMLP(
-        #         dim, 4*dim, bias1=False, bias2=False, checkpoint_lvl=1)
-        # else:
+        # Replace apex.normalization.FusedRMSNorm with our RMSNorm
+        self.rmsnorm2 = RMSNorm(dim)
         self.mlp = MLP(dim, 4*dim, dim, bias1=False, bias2=False)
 
     def forward(self, x, rotary_cos_sin, cu_seqlens=None, attn_mask=None):
@@ -94,33 +143,24 @@ class TransformerBlock(nn.Module):
             qkv = lib.rotary.apply_rotary_pos_emb(
                 qkv, cos.to(half_dtype), sin.to(half_dtype)
             )
-        # flash attention doesn't support attention mask 
-        # if use_flash_attn:
-        #     qkv = rearrange(qkv, 'b s ... -> (b s) ...')
-        #     if cu_seqlens is None:
-        #         cu_seqlens = torch.arange(
-        #             0, (batch_size + 1) * seq_len, step=seq_len,
-        #             dtype=torch.int32, device=qkv.device
-        #         )
-        #     x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
-        #         qkv, cu_seqlens, seq_len, 0., causal=self.causal)
-        #     x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
-        # else:
+        
+        # Extract q, k, v from qkv tensor
+        q, k, v = qkv[:,:,0], qkv[:,:,1], qkv[:,:,2]
 
-        if attn_mask is None:
-            attn_bias = None
-        else:
+        # Process attention bias if needed
+        if attn_mask is not None:
             # b s, ensure memory is aligned by slicing a bigger tensor.
             round_seq_len = (seq_len//8 + 1)*8
-            attn_bias = torch.zeros((batch_size, round_seq_len), dtype=qkv.dtype)
+            attn_bias = torch.zeros((batch_size, round_seq_len), dtype=qkv.dtype, device=qkv.device)
             attn_bias[:, :seq_len].masked_fill_(~attn_mask , float("-inf"))
             # b h s s 
             attn_bias = attn_bias.unsqueeze(1).unsqueeze(-1).repeat(1, self.n_heads, 1, round_seq_len)
             attn_bias = attn_bias[:,:,:seq_len,:seq_len]
+        else:
+            attn_bias = None
 
-        x = xformers.ops.memory_efficient_attention(
-                qkv[:,:,0], qkv[:,:,1], qkv[:,:,2], attn_bias=attn_bias
-            )
+        # Use our standard attention implementation
+        x = attention(q, k, v, attn_bias=attn_bias, causal=self.causal)
         x = rearrange(x, 'b s h d -> b s (h d)', b=batch_size)
         
         x = residual_linear(
@@ -160,8 +200,8 @@ class NoiseSchedule(nn.Module):
             h = torch.tanh(h)
             h = (h @ W2.T)[:,0]
             return h
-        gamma_tilde_0 = gamma_tilde(torch.tensor([0.], device='cuda'))
-        gamma_tilde_1 = gamma_tilde(torch.tensor([1.], device='cuda'))
+        gamma_tilde_0 = gamma_tilde(torch.tensor([0.], device=self.W1.device))
+        gamma_tilde_1 = gamma_tilde(torch.tensor([1.], device=self.W1.device))
         gamma_tilde_t = gamma_tilde(t)
         return (
             (gamma_tilde_t - gamma_tilde_0) /
@@ -194,7 +234,7 @@ class DiffusionModel(nn.Module):
             for i in range(n_blocks)
         ])
 
-        self.output_norm = lib.models.LayerNorm(dim)
+        self.output_norm = LayerNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
         self.output_linear.weight.data.zero_()
         self.output_linear.bias.data.zero_()
@@ -207,7 +247,7 @@ class DiffusionModel(nn.Module):
         selfcond_mask=None, cu_seqlens=None, attn_mask=None, x_embed=None, src_mask=None):
 
         if selfcond_mask is None:
-            selfcond_mask = torch.ones(z.shape[0], device='cuda')
+            selfcond_mask = torch.ones(z.shape[0], device=z.device)
 
         alpha_squared = torch.sigmoid(-gamma)[:,None,None]
         sigma_squared = torch.sigmoid(gamma)[:,None,None]
@@ -233,7 +273,7 @@ class DiffusionModel(nn.Module):
             x_selfcond * float(np.sqrt(self.embed_dim))
         )
 
-        gamma_embed = torch.linspace(-5., 5., 64 // 2, device='cuda')
+        gamma_embed = torch.linspace(-5., 5., 64 // 2, device=z.device)
         gamma_embed = gamma_embed.exp()[None,:] * gamma[:,None]
         gamma_embed = torch.cat([gamma_embed.sin(), gamma_embed.cos()], dim=1)
         gamma_embed = self.gamma_linear(gamma_embed.float())[:,None,:]
@@ -294,7 +334,8 @@ class AutoregressiveModel(nn.Module):
             TransformerBlock(dim, n_heads, True, residual_scale)
             for i in range(n_blocks)
         ])
-        self.output_norm = apex.normalization.FusedRMSNorm(dim)
+        # Replace apex.normalization.FusedRMSNorm with our RMSNorm
+        self.output_norm = RMSNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
         self.first_token_logits = nn.Parameter(torch.zeros(vocab_size))
 
